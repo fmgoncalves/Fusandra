@@ -45,19 +45,20 @@ class Fusandra(fuse.Fuse):
 		if self.prepare_cassandra_keyspace():
 			fuse.Fuse.__init__(self, *args, **kw)
 		else: raise Exception('Failed to setup Fusandra')
+		
+		self.metadata_cache = {}
 	
 	def notify(self, title, message=''):
 		try:
 			self.notification
 		except:
 			pynotify.init(KEYSPACE)
-			self.notification = pynotify.Notification('','')
+			self.notification = pynotify.Notification('FUSANDRA','')
 			self.msg_log = []
 		t = time.time()
 		self.msg_log.append( ( t, '%s - %s' % (title,message ) ) )
 		self.msg_log = filter(lambda x: x[0] > t-5 , self.msg_log)
-		self.notification.update(title, '\n'.join(( x[1] for x in self.msg_log)))
-#		self.notification.update(title, message)
+		self.notification.update('FUSANDRA', '\n'.join(set( x[1] for x in sorted(self.msg_log, key = lambda x: x[0]))))
 		self.notification.show()
 	
 	### CASSANDRA UTILITY METHODS
@@ -94,20 +95,37 @@ class Fusandra(fuse.Fuse):
 #		self.notify('WRITE STAT', '%s -> %s' % (path, cst) )
 		metadata = pycassa.ColumnFamily(self.pool, METADATA_CF)
 		try:
-			metadata.insert( path, { 
-				'st_mode': str(cst.st_mode),
-				'st_ino': str(cst.st_ino),
-				'st_dev': str(cst.st_dev),
-				'st_nlink': str(cst.st_nlink),
-				'st_uid': str(cst.st_uid),
-				'st_gid': str(cst.st_gid),
-				'st_size': str(cst.st_size),
-				'st_atime': str(cst.st_atime),
-				'st_mtime': str(cst.st_mtime),
-				'st_ctime': str(cst.st_ctime),	
-			})
+			cols = {
+				'st_mode': cst.st_mode,
+				'st_ino': cst.st_ino,
+				'st_dev': cst.st_dev,
+				'st_nlink': cst.st_nlink,
+				'st_uid': cst.st_uid,
+				'st_gid': cst.st_gid,
+				'st_size': cst.st_size,
+				'st_atime': cst.st_atime,
+				'st_mtime': cst.st_mtime,
+				'st_ctime': cst.st_ctime,	
+			}
+			metadata.insert( path, dict([ (key, str(cols[key])) for key in cols]) )
+			self.metadata_cache[path] = FusandraStat(**cols)
 		except Exception as e:
-			self.notify('EXCEPTION %s' % inspect.stack()[0][3], e.message)
+			self.notify('STAT %s' % inspect.stack()[0][3], e.message)
+	
+	def update_cache(self, path):
+		try:
+			columns = pycassa.ColumnFamily(self.pool, METADATA_CF).get(path)
+			self.notify('Cache HIT', path)
+			st = FusandraStat(**columns)
+			st.st_atime = int(time.time())
+			self.write_stat(path, st)
+		except Exception as e:
+			self.notify('Cache MISS %s' % path, e)
+			if path == '/':
+				st = FusandraStat.default_dir_stat()
+				self.write_stat(path, st)
+			st = - errno.ENOENT
+		self.metadata_cache[path] = st
 	
 	### FUSE METHODS
 	
@@ -129,27 +147,9 @@ class Fusandra(fuse.Fuse):
 		"""
 		self.notify('%s' % inspect.stack()[0][3], path)
 		
-		metadata = pycassa.ColumnFamily(self.pool, METADATA_CF)
-		
-		try:
-			columns = metadata.get(path)
-		except Exception as e:
-			self.notify('EXCEPTION %s for %s ' % (inspect.stack()[0][3], path), e.message)
-			
-			if path == '/':
-				self.notify('FAIL')
-				st = FusandraStat.default_dir_stat()
-				self.write_stat(path, st)
-				return st
-			return - errno.ENOENT
-		
-		st = FusandraStat(**columns)
-		
-		st.st_atime = int(time.time())
-		
-		self.write_stat(path, st)
-		
-		self.notify('getattr success ', path)
+		if path not in self.metadata_cache:
+			self.update_cache(path)
+		st = self.metadata_cache[path]
 
 		return st
 	
@@ -165,7 +165,6 @@ class Fusandra(fuse.Fuse):
 	def mkdir(self, path, mode):
 		self.notify('%s' % inspect.stack()[0][3], '%s - %s'%(path,mode))
 		
-		metadata = pycassa.ColumnFamily(self.pool, METADATA_CF)
 		directories = pycassa.ColumnFamily(self.pool, DIRECTORIES_CF)
 		
 		pt_idx = path.rindex('/')
@@ -190,8 +189,9 @@ class Fusandra(fuse.Fuse):
 		parent = pt_idx and path[:pt_idx] or '/'
 		
 		pycassa.ColumnFamily(self.pool, METADATA_CF).remove(path)
+		del self.metadata_cache[path]
 		dirs.remove(path)
-		pycassa.ColumnFamily(self.pool, DIRECTORIES_CF).remove(parent, columns=[path])
+		dirs.remove(parent, columns=[path])
 		
 	def unlink(self, path):
 		self.notify('%s' % inspect.stack()[0][3], path)
@@ -201,6 +201,7 @@ class Fusandra(fuse.Fuse):
 		parent = pt_idx and path[:pt_idx] or '/'
 		
 		pycassa.ColumnFamily(self.pool, METADATA_CF).remove(path)
+		del self.metadata_cache[path]
 		pycassa.ColumnFamily(self.pool, FILES_CF).remove(path)		
 		pycassa.ColumnFamily(self.pool, DIRECTORIES_CF).remove(parent, columns=[path])
 
@@ -223,7 +224,6 @@ class Fusandra(fuse.Fuse):
 	def create(self, path, flags, mode):
 		self.notify('%s' % inspect.stack()[0][3], '%s %s %s'%(path, flags, mode))
 		
-		metadata = pycassa.ColumnFamily(self.pool, METADATA_CF)
 		directories = pycassa.ColumnFamily(self.pool, DIRECTORIES_CF)
 		
 		pt_idx = path.rindex('/')
@@ -241,7 +241,6 @@ class Fusandra(fuse.Fuse):
 		pycassa.ColumnFamily(self.pool, FILES_CF).insert(path, {0:''})
 		
 		self.write_stat(path, st)
-		
 	
 	def read(self, path, length, offset, fh=None):
 		#Must return a str value. Otherwise you get an 'Invalid argument' error.
@@ -259,6 +258,7 @@ class Fusandra(fuse.Fuse):
 			res = reduce(lambda x,y: x + cols[y] , sorted(cols.keys()), ''  )
 			
 			res_offset = offset-(start_chunk*CHUNK_SIZE)
+			print res
 			return str( res[ res_offset : res_offset+length ] )
 		except Exception as e:
 			self.notify('EXCEPTION READING '+path, str(e)+e.message)
@@ -268,6 +268,10 @@ class Fusandra(fuse.Fuse):
 	def write(self, path, buf, offset, fh=None):
 		self.notify('%s' % inspect.stack()[0][3], '%s %s %s'%(path, offset, len(buf)))
 
+		if fh:
+			self.notify('ALERT', 'THERE\'s a FILE HANDLER')
+		
+		t0=time.time()
 		files = pycassa.ColumnFamily(self.pool, FILES_CF)
 
 		result = ''
@@ -296,19 +300,19 @@ class Fusandra(fuse.Fuse):
 		i=0
 		to_add = {}
 		while col:
-			to_add[i] = col
+			to_add[start_chunk + i] = col
 			i+=1
 			col = obj.read(CHUNK_SIZE)
 		try:
 			files.insert(path, to_add)
 		except Exception as e:
 			self.notify('EXCEPTION WRITING '+path, str(e)+e.message)
-		
+
 		n_cols = files.get_count(path)
 		
-		st = self.getattr(path)
-		st.st_size = n_cols * CHUNK_SIZE
-		self.write_stat(path,st)
+		pycassa.ColumnFamily(self.pool, METADATA_CF).insert(path, {'st_size' : str(n_cols * CHUNK_SIZE)})
+		
+		self.notify('WRITE DONE', '%d in %.2f s' % (n_cols, time.time()-t0) )
 		
 		return len(buf)
 			
@@ -316,8 +320,12 @@ class Fusandra(fuse.Fuse):
 		self.notify('%s' % inspect.stack()[0][3], '%s %s'% (path,times))
 		try:
 			pycassa.ColumnFamily(self.pool, METADATA_CF).insert(path, { 'st_atime': str(times[0]), 'st_mtime': str(times[1]) } )
+			if path in self.metadata_cache:
+				self.metadata_cache[path].st_atime = str(times[0])
+				self.metadata_cache[path].st_mtime = str(times[1])
+			
 		except Exception as e:
-			self.notify('EXCEPTION READING '+path, str(e)+e.message)			
+			self.notify('EXCEPTION UTIMING '+path, str(e)+e.message)			
 		
 	#Directory methods
 	
@@ -407,7 +415,7 @@ class FusandraStat(fuse.Stat):
 	@staticmethod
 	def default_file_stat():
 		t = int(time.time())
-		return FusandraStat(st_mode = stat.S_IFREG | 0666, st_ino = 0, st_dev = 0, st_nlink = 2, st_uid = 0, st_gid = 0, st_size = 4096, st_atime = t, st_mtime = t, st_ctime = t)
+		return FusandraStat(st_mode = stat.S_IFREG | 0666, st_ino = 0, st_dev = 0, st_nlink = 2, st_uid = 0, st_gid = 0, st_size = CHUNK_SIZE, st_atime = t, st_mtime = t, st_ctime = t)
 	
 	def __init__(self, st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid, st_size, st_atime, st_mtime, st_ctime, **kwargs):
 		self.st_mode = int(st_mode)
