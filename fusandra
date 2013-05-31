@@ -5,133 +5,114 @@ import os
 import stat
 import errno
 import time
-import uuid
-import math
 import inspect
-import cStringIO
-from threading import Thread
+import sys
 
-import pynotify
-import pycassa
 import fuse
 
-KEYSPACE = 'Fusandra'
-METADATA_CF = 'Metadata'
-LOG_CF = 'Log'
-FILES_CF = 'Files'
-DIRECTORIES_CF = 'Directories'
+import pycassa
 
-FUSANDRA_UUID = uuid.UUID('3c88aa90-f1f6-4c53-9ae2-16be6251bbbd')
+KEYSPACE='fusandra'
 
-CHUNK_SIZE = 2 * 1024 # 2 kb
-
-#TODO
-#	Heavy refactoring. Whole thing has been done in hackish manner...
-#	Finish method implementation
-#	Extensive error handling and reporting
-#	Proper logging (instead of relying on libnotify)
-#	Documentation
-#	Pre-Fectching/Caching/Optimizations
-
-#	FUSE Python Reference
-#	http://sourceforge.net/apps/mediawiki/fuse/index.php?title=FUSE_Python_Reference
+#import sys
+#sys.setrecursionlimit(10)
 
 class Fusandra(fuse.Fuse):
 	
-	def __init__(self, server_name = 'localhost', server_port = 9160, *args, **kw):
+	def __init__(self, *args, **kw):
+		print 'Initing'
 		fuse.fuse_python_api = (0, 2)
-		self.server = {'name' : server_name, 'port': server_port }
+		print 'Initing Cassandra'
 		
-		if self.prepare_cassandra_keyspace():
-			fuse.Fuse.__init__(self, *args, **kw)
-		else: raise Exception('Failed to setup Fusandra')
-		
-		self.metadata_cache = {}
-	
-	def notify(self, title, message=''):
-		try:
-			self.notification
-		except:
-			pynotify.init(KEYSPACE)
-			self.notification = pynotify.Notification('FUSANDRA','')
-			self.msg_log = []
-		t = time.time()
-		self.msg_log.append( ( t, '%s - %s' % (title,message ) ) )
-		self.msg_log = filter(lambda x: x[0] > t-5 , self.msg_log)
-		self.notification.update('FUSANDRA', '\n'.join(set( x[1] for x in sorted(self.msg_log, key = lambda x: x[0]))))
-		self.notification.show()
-	
-	### CASSANDRA UTILITY METHODS
-	
-	def prepare_cassandra_keyspace(self):
-		'''
-			Verifies if the Cassandra instance is configured for Fusandra.
-			If not, configure automatically.
-		'''
-		sys = pycassa.SystemManager('%s:%d'% (self.server['name'], self.server['port']))
-		
-		if KEYSPACE not in sys.list_keyspaces():
-			#create required keyspace
-			self.notify('Preparing Cassandra', 'Creating Keyspace %s' % KEYSPACE)
-			sys.create_keyspace(KEYSPACE, replication_factor=1)
-			
-			#create column families: metadata/inode, log, directories, files
-#			self.notify('Preparing Cassandra', 'Creating Column Family %s' % METADATA_CF)
-			sys.create_column_family(KEYSPACE, METADATA_CF, comparator_type=pycassa.system_manager.UTF8_TYPE, comment='Metadata storage')
-#			self.notify('Preparing Cassandra', 'Creating Column Family %s' % LOG_CF)
-			sys.create_column_family(KEYSPACE, LOG_CF, comparator_type=pycassa.system_manager.UTF8_TYPE, default_validation_class=pycassa.system_manager.UTF8_TYPE, comment='Event logs')
-#			self.notify('Preparing Cassandra', 'Creating Column Family %s' % FILES_CF)
-			sys.create_column_family(KEYSPACE, FILES_CF, comparator_type=pycassa.system_manager.INT_TYPE, default_validation_class=pycassa.system_manager.BYTES_TYPE, comment='Files storage (each divided in chunks)')
-#			self.notify('Preparing Cassandra', 'Creating Column Family %s' % DIRECTORIES_CF)
-			sys.create_column_family(KEYSPACE, DIRECTORIES_CF, comparator_type=pycassa.system_manager.UTF8_TYPE, default_validation_class=pycassa.system_manager.UTF8_TYPE, comment='Directories containing each file/directory in itself as a column')
-		
-		sys.close()
-		
-		self.pool = pycassa.connect(KEYSPACE, [ '%s:%d' % (self.server['name'], self.server['port']) ])
-		
-		return True
+		self.open_files = dict()
+		self.metadata, self.files, self.dirs = self.cassandra_client()
+		print 'Initing Fuse'
 
-	def write_stat(self, path, cst):
-#		self.notify('WRITE STAT', '%s -> %s' % (path, cst) )
-		metadata = pycassa.ColumnFamily(self.pool, METADATA_CF)
-		try:
-			cols = {
-				'st_mode': cst.st_mode,
-				'st_ino': cst.st_ino,
-				'st_dev': cst.st_dev,
-				'st_nlink': cst.st_nlink,
-				'st_uid': cst.st_uid,
-				'st_gid': cst.st_gid,
-				'st_size': cst.st_size,
-				'st_atime': cst.st_atime,
-				'st_mtime': cst.st_mtime,
-				'st_ctime': cst.st_ctime,	
-			}
-			metadata.insert( path, dict([ (key, str(cols[key])) for key in cols]) )
-			self.metadata_cache[path] = FusandraStat(**cols)
-		except Exception as e:
-			self.notify('STAT %s' % inspect.stack()[0][3], e.message)
+		os.makedirs(sys.argv[-1])
+		fuse.Fuse.__init__(self, *args, **kw)
+		print 'Inited'
 	
-	def update_cache(self, path):
-		try:
-			columns = pycassa.ColumnFamily(self.pool, METADATA_CF).get(path)
-			self.notify('Cache HIT', path)
-			st = FusandraStat(**columns)
-			st.st_atime = int(time.time())
-			self.write_stat(path, st)
-		except Exception as e:
-			self.notify('Cache MISS %s' % path, e)
-			if path == '/':
-				st = FusandraStat.default_dir_stat()
-				self.write_stat(path, st)
-			st = - errno.ENOENT
-		self.metadata_cache[path] = st
-	
+	def cassandra_client(self):
+		self.setup_cassandra()
+		pool = pycassa.pool.ConnectionPool(KEYSPACE)
+		return ( pycassa.columnfamily.ColumnFamily(pool, 'metadata', read_consistency_level=pycassa.ConsistencyLevel.QUORUM,write_consistency_level=pycassa.ConsistencyLevel.QUORUM),
+					pycassa.columnfamily.ColumnFamily(pool, 'files', read_consistency_level=pycassa.ConsistencyLevel.QUORUM,write_consistency_level=pycassa.ConsistencyLevel.QUORUM),
+					pycassa.columnfamily.ColumnFamily(pool, 'dirs', read_consistency_level=pycassa.ConsistencyLevel.QUORUM,write_consistency_level=pycassa.ConsistencyLevel.QUORUM))
+
+	def setup_cassandra(self):
+		sys = pycassa.system_manager.SystemManager()#'localhost:9160')
+		if KEYSPACE not in sys.list_keyspaces():
+			sys.create_keyspace(KEYSPACE, pycassa.system_manager.SIMPLE_STRATEGY, {'replication_factor': '1'})
+			sys.create_column_family(KEYSPACE, 'metadata', key_validation_class=pycassa.system_manager.UTF8_TYPE, comparator_type=pycassa.system_manager.UTF8_TYPE, default_validation_class=pycassa.system_manager.INT_TYPE)
+			sys.create_column_family(KEYSPACE, 'files', key_validation_class=pycassa.system_manager.UTF8_TYPE, comparator_type=pycassa.system_manager.UTF8_TYPE, default_validation_class=pycassa.system_manager.BYTES_TYPE)
+			sys.create_column_family(KEYSPACE, 'dirs', key_validation_class=pycassa.system_manager.UTF8_TYPE, comparator_type=pycassa.system_manager.UTF8_TYPE, default_validation_class=pycassa.system_manager.INT_TYPE)
+		sys.close()
+
+	@staticmethod
+	def default_dir_stat():
+		st = fuse.Stat()
+		st.st_mode = stat.S_IFDIR
+		st.st_nlink = 2
+		st.st_size = 0
+		st.st_atime = int(time.time())
+		st.st_mtime = st.st_atime
+		st.st_ctime = st.st_atime
+		return st
+
+	@staticmethod
+	def default_file_stat():
+		st = fuse.Stat()
+		st.st_mode = stat.S_IFREG 
+		st.st_nlink = 2
+		st.st_atime = int(time.time())
+		st.st_mtime = st.st_atime
+		st.st_ctime = st.st_atime
+		st.st_size = 0
+		return st
+
+	@staticmethod
+	def stat_of_dict(d):
+		st = fuse.Stat()
+		st.st_mode = d['st_mode']
+		st.st_nlink = d['st_nlink']
+		st.st_size = d['st_size']
+		st.st_atime = d['st_atime']
+		st.st_mtime = d['st_mtime']
+		st.st_ctime = d['st_ctime']
+		return st
+
+	@staticmethod
+	def dict_of_stat(st):
+		d = {
+			'st_mode': st.st_mode,
+			'st_nlink': st.st_nlink,
+			'st_atime': st.st_atime,
+			'st_mtime': st.st_mtime,
+			'st_ctime': st.st_ctime,
+			'st_size': st.st_size
+		}
+		return d
+
+	def load_file(self,path):
+		print 'load file {}'.format(path)
+		f = dict(self.files.get(path))
+		f['attr'] = Fusandra.stat_of_dict(self.metadata.get(path))
+		f['content'] = bytearray(f['content'])#,"utf-8")
+		fh = '{}/{}'.format(path,int(time.time()))
+		self.open_files[fh] = (path, f)
+		return fh
+
+	def sync_file(self,fh):
+		print 'sync file {}'.format(fh)
+		path,f = self.open_files[fh]
+		#print "syncing {} from {}".format(path,f)
+		self.files.insert(path, {'content': str(f['content'])})
+		self.metadata.insert(path, {'st_size': f['attr'].st_size })
+
 	### FUSE METHODS
 	
 	#General Filesystem Methods
 	def getattr(self, path):
-		#TODO go to metadata and fetch
 		"""
 		- st_mode (protection bits)
 		- st_ino (inode number)
@@ -145,212 +126,127 @@ class Fusandra(fuse.Fuse):
 		- st_ctime (platform dependent; time of most recent metadata change on Unix,
 					or the time of creation on Windows)
 		"""
-		self.notify('%s' % inspect.stack()[0][3], path)
-		
-		if path not in self.metadata_cache:
-			self.update_cache(path)
-		st = self.metadata_cache[path]
-
-		return st
+		print '{} {}'.format(inspect.stack()[0][3], path)
+		try:
+			st = dict(self.metadata.get(path))
+			#print '{}'.format(st)
+			return Fusandra.stat_of_dict(st)
+		except pycassa.NotFoundException:
+			#print "{} doesn't exist".format(path)
+			return - errno.ENOENT
 	
 	def fsinit(self):
-		if pynotify.init(KEYSPACE):
-			self.notify("Started %s"%KEYSPACE)
+		print "fsinit"
+		try:
+			self.metadata.get('/')
+		except pycassa.NotFoundException:
+			print 'go mkdir /'
+			self.mkdir('/', 0o755)
 	
-	def mknod(self, path, mode, rdev):
-		self.notify('%s' % inspect.stack()[0][3], '%s %s %s'% (path,mode,rdev))
-		#TODO
-
+#	def mknod(self, path, mode, rdev):
+#		print '{} {}'.format(inspect.stack()[0][3], '%s %s %s'% (path,mode,rdev))
+#		return - errno.ENOENT
 	
 	def mkdir(self, path, mode):
-		self.notify('%s' % inspect.stack()[0][3], '%s - %s'%(path,mode))
-		
-		directories = pycassa.ColumnFamily(self.pool, DIRECTORIES_CF)
-		
-		pt_idx = path.rindex('/')
-		parent = pt_idx and path[:pt_idx] or '/'
-		
-		self.notify('parent', parent)
-		
-		directories.insert(parent,{ path: 'directory' })
-		
-		self.write_stat(path, FusandraStat.default_dir_stat())
-	
-	def rmdir(self, path):
-		self.notify('%s' % inspect.stack()[0][3], path)
-		
-		dirs = pycassa.ColumnFamily(self.pool, DIRECTORIES_CF)
-		
-		if dirs.get_count(path) > 0:
-			return - errno.ENOTEMPTY
-		
-		pt_idx = path.rindex('/')
-		self.notify('PT_IDX', str(pt_idx))
-		parent = pt_idx and path[:pt_idx] or '/'
-		
-		pycassa.ColumnFamily(self.pool, METADATA_CF).remove(path)
-		del self.metadata_cache[path]
-		dirs.remove(path)
-		dirs.remove(parent, columns=[path])
-		
-	def unlink(self, path):
-		self.notify('%s' % inspect.stack()[0][3], path)
-		
-		pt_idx = path.rindex('/')
-		self.notify('PT_IDX', str(pt_idx))
-		parent = pt_idx and path[:pt_idx] or '/'
-		
-		pycassa.ColumnFamily(self.pool, METADATA_CF).remove(path)
-		del self.metadata_cache[path]
-		pycassa.ColumnFamily(self.pool, FILES_CF).remove(path)		
-		pycassa.ColumnFamily(self.pool, DIRECTORIES_CF).remove(parent, columns=[path])
+		print '{} {} {}'.format(inspect.stack()[0][3], path,mode)
+		st = Fusandra.default_dir_stat()
+		st.st_mode = st.st_mode | mode
+		self.metadata.insert(path, Fusandra.dict_of_stat(st))
+		self.dirs.insert(path, {'.':1,'..':1})
+		while path != '/':
+			s = os.path.dirname(path)
+			#print 'Adding {} to {}'.format(path,s)
+			self.dirs.insert(s,{path:1})
+			path = s
 
-		
-	
-#	def rename(self, old, new):
-#		self.notify('%s' % inspect.stack()[0][3], '%s -> %s' % (old, new))
-#		#TODO this method has too many possible consistency problems, should probably remain unimplemented
-	
+	def rmdir(self, path):
+		print '{} {}'.format(inspect.stack()[0][3], path)
+		self.metadata.remove(path)
+		self.dirs.remove(path)
+		self.dirs.remove(os.path.dirname(path),columns=[path])
+
+	def unlink(self, path):
+		print '{} {}'.format(inspect.stack()[0][3], path)
+		self.metadata.remove(path)
+		#print 'unlinked	metadata {}'.format(path)
+		self.files.remove(path)
+		#print 'unlinked	file {}'.format(path)
+		self.dirs.remove(os.path.dirname(path),columns=[os.path.basename(path)])
+		#print 'unlinked	parent dir {} {}'.format(os.path.dirname(path),path)
+
 	#File Operation Methods
 
 	def open(self, path, flags):
-		self.notify('%s' % inspect.stack()[0][3], path)
-		try:
-			pycassa.ColumnFamily(self.pool, FILES_CF).get(path, column_count = 1)
-			return 0
-		except:
-			return - errno.ENOENT
+		print '{} {}'.format(inspect.stack()[0][3], path)
+		return self.load_file(path)
 	
 	def create(self, path, flags, mode):
-		self.notify('%s' % inspect.stack()[0][3], '%s %s %s'%(path, flags, mode))
-		
-		directories = pycassa.ColumnFamily(self.pool, DIRECTORIES_CF)
-		
-		pt_idx = path.rindex('/')
-		self.notify('PT_IDX', str(pt_idx))
-		parent = pt_idx and path[:pt_idx] or '/'
-		
-		self.notify('parent', parent)
-		
-		directories.insert(parent,{ path: 'file' })
-		
-		st = FusandraStat.default_file_stat()
-		st.st_size = 0
-		st.st_mode = stat.S_IFREG | mode;
-		
-		pycassa.ColumnFamily(self.pool, FILES_CF).insert(path, {0:''})
-		
-		self.write_stat(path, st)
+		print '{} {}'.format(inspect.stack()[0][3], '%s %s %s'%(path, flags, mode))
+		if (flags & os.O_CREAT) == os.O_CREAT:
+			st = Fusandra.default_file_stat()
+			st.st_mode = st.st_mode | mode
+			self.metadata.insert(path, Fusandra.dict_of_stat(st))
+			self.dirs.insert(os.path.dirname(path),{os.path.basename(path):1})
+			self.files.insert(path, { 'content': '' })
+			return self.load_file(path)
+		else:
+			return - errno.EEXIST
+
+	def truncate ( self, path, size ):
+		print '{} {}'.format(inspect.stack()[0][3], '%s %s'%(path, size))
+
+		self.files.insert(path, { 'content' : '' })
+		self.metadata.insert(path,{'st_size': 0})
 	
 	def read(self, path, length, offset, fh=None):
 		#Must return a str value. Otherwise you get an 'Invalid argument' error.
-		self.notify('%s' % inspect.stack()[0][3], '%s %s %s' % (path,length, offset))
+		print '{} {}'.format(inspect.stack()[0][3], '%s %s %s %s' % (path,length, offset, fh))
 		
-		try:
-			start_chunk = offset / CHUNK_SIZE
-			end_chunk = int(math.ceil((length+offset)/float(CHUNK_SIZE)))
-		
-			self.notify('Calculated chunks to retrieve ', '%d %s'%(start_chunk,end_chunk) )
-			files = pycassa.ColumnFamily(self.pool, FILES_CF)
-		
-			cols = files.get(path, column_start=start_chunk,column_finish=(end_chunk+1))
-			
-			res = reduce(lambda x,y: x + cols[y] , sorted(cols.keys()), ''  )
-			
-			res_offset = offset-(start_chunk*CHUNK_SIZE)
-			print res
-			return str( res[ res_offset : res_offset+length ] )
-		except Exception as e:
-			self.notify('EXCEPTION READING '+path, str(e)+e.message)
-			return ''
-		
+		if fh in self.open_files:
+			s = self.open_files[fh][1]['content']
+			s = s[offset:offset+length]
+			#print 'Str at read {}'.format(str(s))
+			return str(s)
+		else:
+			return - errno.ENOENT
 		
 	def write(self, path, buf, offset, fh=None):
-		self.notify('%s' % inspect.stack()[0][3], '%s %s %s'%(path, offset, len(buf)))
+		print '{} {}'.format(inspect.stack()[0][3], '%s %s %s'%(path, offset, len(buf)))
 
-		if fh:
-			self.notify('ALERT', 'THERE\'s a FILE HANDLER')
-		
-		t0=time.time()
-		files = pycassa.ColumnFamily(self.pool, FILES_CF)
+		if fh in self.open_files:
+			f = self.open_files[fh][1]
+			f['content'][offset:offset+len(buf)] = buf
+			f['attr'].st_size = len(f['content'])
+			#print self.open_files[fh][1]['content']
+			return len(buf)
+		else:
+			return - errno.ENOENT
 
-		result = ''
-				
-		start_chunk = offset / CHUNK_SIZE
-		
-		res_offset = offset-(start_chunk*CHUNK_SIZE)
-		
-		if res_offset:
-			result += files.get(path, columns=[start_chunk])[:res_offset]
-		
-		result += buf
-		
-		end_chunk = int(math.ceil((len(buf)+offset)/float(CHUNK_SIZE)))
-		
-		res_padding = (offset+len(buf)) % CHUNK_SIZE
-		
-		if res_padding:
-			try:
-				result += files.get(path, columns=[end_chunk])[-res_padding:]
-			except:
-				pass
-		
-		obj = cStringIO.StringIO(result)
-		col = obj.read(CHUNK_SIZE)
-		i=0
-		to_add = {}
-		while col:
-			to_add[start_chunk + i] = col
-			i+=1
-			col = obj.read(CHUNK_SIZE)
-		try:
-			files.insert(path, to_add)
-		except Exception as e:
-			self.notify('EXCEPTION WRITING '+path, str(e)+e.message)
+	def flush(self, path, fh=None):
+		print '{} {}'.format(inspect.stack()[0][3], '{} {}'.format(path, fh))
+		self.sync_file(fh)
 
-		n_cols = files.get_count(path)
-		
-		pycassa.ColumnFamily(self.pool, METADATA_CF).insert(path, {'st_size' : str(n_cols * CHUNK_SIZE)})
-		
-		self.notify('WRITE DONE', '%d in %.2f s' % (n_cols, time.time()-t0) )
-		
-		return len(buf)
-			
 	def utime ( self, path, times ):
-		self.notify('%s' % inspect.stack()[0][3], '%s %s'% (path,times))
-		try:
-			pycassa.ColumnFamily(self.pool, METADATA_CF).insert(path, { 'st_atime': str(times[0]), 'st_mtime': str(times[1]) } )
-			if path in self.metadata_cache:
-				self.metadata_cache[path].st_atime = str(times[0])
-				self.metadata_cache[path].st_mtime = str(times[1])
-			
-		except Exception as e:
-			self.notify('EXCEPTION UTIMING '+path, str(e)+e.message)			
+		print '{} {}'.format(inspect.stack()[0][3], '{} {}'.format(path,times))
+		self.metadata.insert(path, { 'st_atime': times[0], 'st_mtime': times[1] })
 		
 	#Directory methods
 	
 	def readdir(self, path, offset):
-		self.notify('%s' % inspect.stack()[0][3], '%s %s' % (path,offset))
-		
-		dirs = pycassa.ColumnFamily(self.pool, DIRECTORIES_CF)
-		try:
-			elems = dirs.get(path).keys()
-		except:
-			elems = []
-	
-		for name in ['.', '..']:
-			yield fuse.Direntry(name)
-		for name in elems:
-			try:
-				yield fuse.Direntry(str(name[name.rindex('/')+1:]))
-			except Exception as e:
-				self.notify('DAMN '+name,e.message)
+		print '{} {}'.format(inspect.stack()[0][3], '%s %s' % (path,offset))
+		dirz = list(self.dirs.get(path).keys())
+		#print 'yielding these {}'.format(dirz)
+		for name in dirz:
+			#print 'yielding {}'.format(name)
+			de = fuse.Direntry(os.path.basename(str(name)))
+			#print 'de {}'.format(de)
+			yield de
 
 #TODO other methods to look into (implement where relevant)
 
-#	def chmod ( self, path, mode ):
-#		print '*** chmod', path, oct(mode)
-#		return -errno.ENOSYS
+	def chmod ( self, path, mode ):
+		print '{} {}'.format(inspect.stack()[0][3], '{} {}'.format(path,oct(mode)))
+		self.metadata.insert(path, { 'st_mode': mode })
 
 #	def chown ( self, path, uid, gid ):
 #		print '*** chown', path, uid, gid
@@ -400,39 +296,8 @@ class Fusandra(fuse.Fuse):
 #		print '*** symlink', targetPath, linkPath
 #		return -errno.ENOSYS
 
-#	def truncate ( self, path, size ):
-#		print '*** truncate', path, size
-#		return -errno.ENOSYS
-
-
-class FusandraStat(fuse.Stat):
-
-	@staticmethod
-	def default_dir_stat():
-		t = int(time.time())
-		return FusandraStat(st_mode = stat.S_IFDIR | 0755, st_ino = 0, st_dev = 0, st_nlink = 2, st_uid = 0, st_gid = 0, st_size = 4096, st_atime = t, st_mtime = t, st_ctime = t)
-	
-	@staticmethod
-	def default_file_stat():
-		t = int(time.time())
-		return FusandraStat(st_mode = stat.S_IFREG | 0666, st_ino = 0, st_dev = 0, st_nlink = 2, st_uid = 0, st_gid = 0, st_size = CHUNK_SIZE, st_atime = t, st_mtime = t, st_ctime = t)
-	
-	def __init__(self, st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid, st_size, st_atime, st_mtime, st_ctime, **kwargs):
-		self.st_mode = int(st_mode)
-		self.st_ino = int(st_ino)
-		self.st_dev = int(st_dev)
-		self.st_nlink = int(st_nlink)
-		self.st_uid = int(st_uid)
-		self.st_gid = int(st_gid)
-		self.st_size = int(st_size)
-		self.st_atime = int(st_atime)
-		self.st_mtime = int(st_mtime)
-		self.st_ctime = int(st_ctime)
-	
-	def __str__(self):
-		return str([self.st_mode, self.st_ino, self.st_dev, self.st_nlink, self.st_uid, self.st_gid, self.st_size, self.st_atime, self.st_mtime, self.st_ctime,])
-
 if __name__ == '__main__':
-	cf = Fusandra(version="%prog " + fuse.__version__)
+	cf = Fusandra()
 	cf.parse(errex=1)
 	cf.main()
+	print 'Done'

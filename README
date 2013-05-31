@@ -1,4 +1,4 @@
-Fusandra - Cassandra FileSystem in UserspacE (FUSE) implementation
+Fusandra - Cassandra Filesystem in Userspace (FUSE) implementation
 
 DESCRIPTION:
 
@@ -12,9 +12,9 @@ a few interesting use cases.
 
 USAGE
 
-To use Fusandra you'll need a running instance of Cassandra (0.8.x preferably)
-with no authentication. Fusandra will automatically create all the structures it
-needs whithin Cassandra on its first run
+To use Fusandra you'll need a running instance of Cassandra with no authentication.
+Fusandra will automatically create all the structures it needs whithin Cassandra
+on its first run
 
 	chmod +x fusandra
 	./fusandra directory_to_be_mounted
@@ -22,21 +22,19 @@ needs whithin Cassandra on its first run
 
 NOTES
 
-This is still a VERY early version of Fusandra, it should be treated as highly 
-unstable.
+This is a usable, yet very experimental project. Proceed with caution.
 
 
 TODO
 
-The rest of the implementation, Fusandra is still very incomplete and barely 
-usable.
+Symlinks and other filesystem functionality that isn't basic file/dir manipulation.
 Any and all configuration options, including command line options to choose the 
 Cassandra instance to use, authentication options, etc.
 
 
 LICENSE
 
-Copyright (C) 2011 by Filipe Gonçalves < the.wa.syndrome@gmail.com >
+Copyright (C) 2013 by Filipe Gonçalves < the.wa.syndrome@gmail.com >
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
