@@ -1,5 +1,7 @@
 Fusandra - Cassandra Filesystem in Userspace (FUSE) implementation
 
+[![No Maintenance Intended](http://unmaintained.tech/badge.svg)](http://unmaintained.tech/)
+
 DESCRIPTION:
 
 Fusandra is a proof of concept distributed filesystem, mountable anywhere and 
